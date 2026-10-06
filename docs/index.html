@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kompas rynku</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600&display=swap" rel="stylesheet">
+<style>
+:root{--tlo:#eef0f2;--karta:#fff;--tusz:#1c2024;--tusz2:#545c64;--tusz3:#7d868e;--linia:#d5dade;
+--zielony:#2f8a4a;--zolty:#c98a00;--czerwony:#c4372c;--szary:#8a929a;--seria2:#2f6fb5}
+@media (prefers-color-scheme:dark){:root{--tlo:#121518;--karta:#1b1f23;--tusz:#e4e7ea;--tusz2:#a8b0b7;
+--tusz3:#78818a;--linia:#2c3238;--seria2:#6aa3e0}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--tlo);color:var(--tusz);font:15px/1.55 "IBM Plex Sans",system-ui,sans-serif;font-variant-numeric:tabular-nums}
+main{max-width:1080px;margin:0 auto;padding:28px 20px 48px}
+header{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+h1{font:600 28px/1.15 "IBM Plex Sans Condensed",sans-serif;margin:0}
+.meta{color:var(--tusz2);font-size:13px}
+.demo{color:var(--czerwony);font-weight:600}
+.panel{background:#1a1f24;border-radius:10px;padding:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px}
+.lampka{border:1px solid #2e353b;border-radius:4px;padding:10px 12px;background:#14181c;color:#7c858d;font:600 15px/1.25 "IBM Plex Sans Condensed",sans-serif}
+.lampka small{display:block;font-weight:500;font-size:12.5px;margin-top:3px}
+.lampka.ZIELONY{color:#7ee09a;border-color:#2f8a4a;background:#11251a}
+.lampka.ŻÓŁTY{color:#ffcc55;border-color:#c98a00;background:#2a2008}
+.lampka.CZERWONY{color:#ff8478;border-color:#c4372c;background:#2e1311}
+.werdykt{margin:18px 0 4px;padding:0;list-style:none;max-width:76ch}
+.werdykt li{padding-left:16px;position:relative;margin:5px 0}
+.werdykt li::before{content:"";position:absolute;left:2px;top:.62em;width:6px;height:6px;border-radius:50%;background:var(--tusz3)}
+h2{font:600 16px/1.3 "IBM Plex Sans Condensed",sans-serif;color:var(--tusz2);margin:28px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--linia)}
+.siatka{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.karta{background:var(--karta);border:1px solid var(--linia);border-radius:8px;padding:14px 16px}
+.glowa{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.nazwa{color:var(--tusz2);font-size:14px}
+.strefa{font:600 12.5px/1 "IBM Plex Sans Condensed",sans-serif;padding:5px 8px;border-radius:3px;color:#fff;background:var(--szary)}
+.s-ZIELONY{background:var(--zielony)}.s-ŻÓŁTY{background:var(--zolty);color:#1f1600}.s-CZERWONY{background:var(--czerwony)}
+.wartosc{font:600 30px/1.15 "IBM Plex Sans Condensed",sans-serif;margin-top:6px}
+.kom{color:var(--tusz3);font-size:13px;min-height:2.6em}
+.wykres{position:relative;height:150px;margin-top:6px}
+.miara{position:relative;height:16px;border-radius:3px;overflow:hidden;display:flex;margin-top:16px}
+.skala{position:relative;height:16px;font-size:11.5px;color:var(--tusz3);margin-top:4px}
+.skala span{position:absolute;transform:translateX(-50%)}
+.brakjs{color:var(--tusz3);font-size:13px;margin-top:10px}
+footer{margin-top:34px;color:var(--tusz3);font-size:13px;max-width:80ch}
+</style>
+</head>
+<body>
+<main>
+<header><h1>Kompas rynku</h1><div class="meta" id="meta"></div></header>
+<section class="panel" id="panel" aria-label="Stan wskaźników"></section>
+<ul class="werdykt" id="werdykt"></ul>
+<div id="grupy"></div>
+<footer>Kompas pokazuje stan rynku według reguł ustalonych z góry. Nie podaje daty spadków ani wzrostów.
+Progi stref zmieniasz w słowniku PROGI w skrypcie. Każde uruchomienie dopisuje odczyt do pliku kompas_historia.csv.</footer>
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const D = {"data": "2026-10-06", "demo": false, "grupy": [["Wycena (horyzont: dekada)", ["CAPE"]], ["Cykl i kredyt (wyprzedzające)", ["Krzywa 10Y-3M", "Spready HY"]], ["Potwierdzenie recesji (opóźniający)", ["Reguła Sahm"]], ["Rynek teraz (współbieżne)", ["VIX", "Trend S&P 500"]]], "oceny": {"CAPE": {"strefa": "CZERWONY", "wartosc": "41.4", "komentarz": "wpis ręczny z 2026-06-12"}, "Krzywa 10Y-3M": {"strefa": "BRAK", "wartosc": "brak", "komentarz": "brak danych"}, "Spready HY": {"strefa": "BRAK", "wartosc": "brak", "komentarz": "brak danych"}, "Reguła Sahm": {"strefa": "BRAK", "wartosc": "brak", "komentarz": "brak danych"}, "VIX": {"strefa": "BRAK", "wartosc": "brak", "komentarz": "brak danych"}, "Trend S&P 500": {"strefa": "BRAK", "wartosc": "brak", "komentarz": "brak danych"}}, "werdykt": ["Cykl i kredyt bez zapalnika recesyjnego.", "Wycena wysoka: niższe oczekiwane zwroty w dekadę. O najbliższym kwartale nie mówi nic.", "Czerwone: 1/6, żółte: 0/6. Barometr, nie zegarek - żadna strefa nie podaje daty."], "serie": {}, "cape": {"wartosc": 41.4, "progi": [20, 30], "data": "2026-06-12"}};
+const ETYK = {ZIELONY:"zielony", "ŻÓŁTY":"żółty", CZERWONY:"czerwony", BRAK:"brak danych"};
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const dzien = v => {const d = new Date(v); return String(d.getDate()).padStart(2,"0")+"."+String(d.getMonth()+1).padStart(2,"0")+"."+d.getFullYear();};
+
+document.getElementById("meta").innerHTML = "Stan na " + D.data + ". Dane: FRED, CAPE wpisane ręcznie " + D.cape.data + "." +
+  (D.demo ? ' <span class="demo">Dane demo, nie prawdziwe.</span>' : "");
+const kolejnosc = D.grupy.flatMap(g => g[1]);
+document.getElementById("panel").innerHTML = kolejnosc.map(k => {
+  const o = D.oceny[k];
+  return '<div class="lampka ' + o.strefa + '">' + k + "<small>" + o.wartosc + ", " + ETYK[o.strefa] + "</small></div>";
+}).join("");
+document.getElementById("werdykt").innerHTML = D.werdykt.map(l => "<li>" + l + "</li>").join("");
+
+const ID = {}; let n = 0, h = "";
+const proc = x => Math.min(100, Math.max(0, x / 50 * 100));
+D.grupy.forEach(([grupa, nazwy]) => {
+  h += "<h2>" + grupa + '</h2><div class="siatka">';
+  nazwy.forEach(k => {
+    const o = D.oceny[k];
+    h += '<div class="karta"><div class="glowa"><span class="nazwa">' + k + '</span><span class="strefa s-' + o.strefa + '">' + ETYK[o.strefa] + "</span></div>" +
+         '<div class="wartosc">' + o.wartosc + '</div><div class="kom">' + o.komentarz + "</div>";
+    if (k === "CAPE") {
+      const p = D.cape.progi;
+      h += '<div class="miara"><div style="width:' + proc(p[0]) + '%;background:var(--zielony);opacity:.35"></div>' +
+           '<div style="width:' + (proc(p[1]) - proc(p[0])) + '%;background:var(--zolty);opacity:.4"></div>' +
+           '<div style="flex:1;background:var(--czerwony);opacity:.35"></div>' +
+           '<div style="position:absolute;left:' + proc(D.cape.wartosc) + '%;top:0;bottom:0;width:3px;background:var(--tusz)"></div>' +
+           '<div style="position:absolute;left:' + proc(44.2) + '%;top:0;bottom:0;border-left:1px dashed var(--tusz2)"></div></div>' +
+           '<div class="skala"><span style="left:2%">0</span><span style="left:' + proc(p[0]) + '%">' + p[0] + '</span><span style="left:' + proc(p[1]) + '%">' + p[1] +
+           '</span><span style="left:' + proc(44.2) + '%">rekord 1999</span></div>';
+    } else if (D.serie[k]) {
+      ID[k] = "w" + (n++);
+      h += '<div class="wykres"><canvas id="' + ID[k] + '" role="img" aria-label="Wykres: ' + k + ' z ostatnich lat na tle stref"></canvas></div>';
+    }
+    h += "</div>";
+  });
+  h += "</div>";
+});
+document.getElementById("grupy").innerHTML = h;
+
+if (!window.Chart) {
+  document.querySelectorAll(".wykres").forEach(el => el.outerHTML = '<div class="brakjs">Wykresy wymagają internetu (biblioteka Chart.js).</div>');
+} else {
+  const pasy = {id: "pasy", beforeDatasetsDraw(c, a, o) {
+    const {ctx, chartArea: ca, scales: {y}} = c;
+    if (o.progi) {
+      [[y.min, o.progi[0], "rgba(47,138,74,0.11)"], [o.progi[0], o.progi[1], "rgba(201,138,0,0.15)"], [o.progi[1], y.max, "rgba(196,55,44,0.11)"]]
+        .forEach(([lo, hi, kol]) => {
+          const g = y.getPixelForValue(Math.min(hi, y.max)), d = y.getPixelForValue(Math.max(lo, y.min));
+          if (d > g) { ctx.fillStyle = kol; ctx.fillRect(ca.left, g, ca.right - ca.left, d - g); }
+        });
+    }
+    if (o.zero) {
+      const p = y.getPixelForValue(0);
+      ctx.save(); ctx.strokeStyle = "#c4372c"; ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.moveTo(ca.left, p); ctx.lineTo(ca.right, p); ctx.stroke(); ctx.restore();
+    }
+  }};
+  Object.keys(ID).forEach(k => {
+    const s = D.serie[k], ys = s.pkt.map(p => p[1]);
+    let mn, mx;
+    if (s.progi) { mn = Math.min(0, ...ys); mx = Math.max(Math.max(...ys) * 1.05, s.progi[1] * 1.25); }
+    const ds = [{label: k, data: s.pkt.map(p => ({x: p[0], y: p[1]})), borderColor: css("--tusz"), borderWidth: 1.6, pointRadius: 0, tension: 0.2}];
+    if (s.pkt2) ds.push({label: "średnia 10-mies.", data: s.pkt2.map(p => ({x: p[0], y: p[1]})), borderColor: css("--seria2"), borderDash: [5, 4], borderWidth: 2, pointRadius: 0});
+    new Chart(document.getElementById(ID[k]), {type: "line", data: {datasets: ds}, plugins: [pasy],
+      options: {responsive: true, maintainAspectRatio: false, animation: false,
+        interaction: {mode: "nearest", axis: "x", intersect: false},
+        plugins: {legend: {display: false}, pasy: {progi: s.progi, zero: s.zero},
+          tooltip: {callbacks: {title: it => dzien(it[0].parsed.x), label: c => c.dataset.label + ": " + c.parsed.y.toFixed(2)}}},
+        scales: {x: {type: "linear", min: s.pkt[0][0], max: s.pkt[s.pkt.length - 1][0],
+                    afterBuildTicks: ax => { ax.ticks = []; for (let r = new Date(ax.min).getFullYear() + 1; r <= new Date(ax.max).getFullYear(); r++) ax.ticks.push({value: Date.UTC(r, 0, 1)}); },
+                    ticks: {color: css("--tusz3"), callback: v => new Date(v).getFullYear()}, grid: {display: false}},
+                 y: {min: mn, max: mx, ticks: {color: css("--tusz3"), maxTicksLimit: 5}, grid: {color: css("--linia")}}}}});
+  });
+}
+</script>
+</body>
+</html>
