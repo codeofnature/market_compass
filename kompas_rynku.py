@@ -35,8 +35,8 @@ import pandas as pd
 
 # CAPE nie ma darmowego, stabilnego źródła CSV. Raz na kwartał przepisz
 # wartość z https://www.multpl.com/shiller-pe (zmienia się powoli).
-CAPE_RECZNIE = 41.4
-CAPE_DATA = "2026-06-12"
+CAPE_RECZNIE = 41.67
+CAPE_DATA = "2026-10-05"
 
 # Progi stref (zielony < pierwszy próg <= żółty < drugi próg <= czerwony).
 # Dla wszystkich poniższych "więcej = gorzej".
