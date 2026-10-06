@@ -1,4 +1,4 @@
-name: market_compass
+name: Kompas rynku
 
 on:
   schedule:
@@ -24,6 +24,8 @@ jobs:
         run: pip install pandas
 
       - name: Uruchomienie kompasu
+        env:
+          FRED_API_KEY: ${{ secrets.76aa11471a5cc215000dbc586150fcb2 }}   # klucz z Settings > Secrets, w logach ukryty
         run: python kompas_rynku.py
 
       - name: Przygotowanie strony
