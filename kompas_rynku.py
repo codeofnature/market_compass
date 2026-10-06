@@ -18,9 +18,12 @@ Wyniki trafiają do folderu "kompas_wyniki" obok skryptu:
 import argparse
 import io
 import json
+import os
+import re
 import sys
+import urllib.error
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +55,19 @@ LAT_NA_WYKRESIE = 5
 DANE_OD = "2015-01-01"
 FOLDER = Path(__file__).resolve().parent / "kompas_wyniki"
 
+# Stopa referencyjna NBP: (od kiedy obowiązuje, wartość w %). NBP nie ma
+# wygodnego API z historią stóp, więc historia jest tutaj. Skrypt sam
+# sprawdza aktualną stopę w NBP i podpowie, gdy trzeba dopisać zmianę.
+STOPA_REF_ZMIANY = [
+    ("2020-05-29", 0.10), ("2021-10-07", 0.50), ("2021-11-04", 1.25), ("2021-12-09", 1.75),
+    ("2022-01-05", 2.25), ("2022-02-09", 2.75), ("2022-03-09", 3.50), ("2022-04-07", 4.50),
+    ("2022-05-06", 5.25), ("2022-06-09", 6.00), ("2022-07-08", 6.50), ("2022-09-08", 6.75),
+    ("2023-09-07", 6.00), ("2023-10-05", 5.75), ("2025-05-08", 5.25), ("2025-07-03", 5.00),
+    ("2025-09-04", 4.75), ("2025-10-09", 4.50), ("2025-11-06", 4.25), ("2025-12-04", 4.00),
+    ("2026-03-05", 3.75),
+]
+CEL_INFLACYJNY = (1.5, 3.5)  # cel NBP 2,5% ± 1 pp
+
 # Alias miesiąca: nowe pandas używa "ME", starsze "M".
 try:
     pd.Series([1.0], index=pd.to_datetime(["2020-01-31"])).resample("ME")
@@ -65,19 +81,40 @@ except ValueError:
 # =====================================================================
 
 def pobierz_fred(seria: str) -> pd.Series:
-    """Pobiera serię z FRED jako CSV (bez klucza API).
+    """Pobiera serię z FRED.
 
-    FRED zwraca 2 kolumny: data i wartość. Nazwa kolumny daty bywała
-    różna ("DATE" lub "observation_date"), dlatego bierzemy kolumny po
-    pozycji, a nie po nazwie. Braki danych FRED oznacza kropką ".".
+    Z kluczem API (zmienna środowiskowa FRED_API_KEY) używa oficjalnego
+    API - to jedyna droga, która działa niezawodnie z serwerów, np. z
+    GitHub Actions. Bez klucza pobiera zwykły CSV ze strony wykresu,
+    co zwykle działa z domowego komputera.
     """
-    url = (f"https://fred.stlouisfed.org/graph/fredgraph.csv"
-           f"?id={seria}&cosd={DANE_OD}")
+    klucz = os.environ.get("FRED_API_KEY", "").strip()
+    if klucz:
+        url = ("https://api.stlouisfed.org/fred/series/observations"
+               f"?series_id={seria}&api_key={klucz}&file_type=json"
+               f"&observation_start={DANE_OD}")
+    else:
+        url = (f"https://fred.stlouisfed.org/graph/fredgraph.csv"
+               f"?id={seria}&cosd={DANE_OD}")
     zapytanie = urllib.request.Request(
         url, headers={"User-Agent": "Mozilla/5.0 (kompas-rynku)"})
     with urllib.request.urlopen(zapytanie, timeout=30) as odp:
         tekst = odp.read().decode("utf-8")
+    if klucz:
+        return json_na_serie(json.loads(tekst), seria)
     return csv_na_serie(tekst, seria)
+
+
+def json_na_serie(obj: dict, nazwa: str) -> pd.Series:
+    """Odpowiedź API: lista obserwacji {"date": ..., "value": ...};
+    braki danych oznaczone kropką, jak w CSV."""
+    obs = obj.get("observations", [])
+    s = pd.Series([o["value"] for o in obs],
+                  index=pd.to_datetime([o["date"] for o in obs]), name=nazwa)
+    s = pd.to_numeric(s, errors="coerce").dropna().sort_index()
+    if s.empty:
+        raise ValueError("API FRED nie zwróciło danych")
+    return s
 
 
 def csv_na_serie(tekst: str, nazwa: str) -> pd.Series:
@@ -85,6 +122,9 @@ def csv_na_serie(tekst: str, nazwa: str) -> pd.Series:
     daty = pd.to_datetime(df.iloc[:, 0])
     wartosci = pd.to_numeric(df.iloc[:, 1], errors="coerce")
     s = pd.Series(wartosci.values, index=daty, name=nazwa).dropna()
+    if s.empty:
+        # Zamiast CSV przyszła np. strona HTML z blokadą dla botów.
+        raise ValueError("FRED zwrócił pustą odpowiedź lub stronę HTML zamiast CSV")
     return s.sort_index()
 
 
@@ -231,11 +271,16 @@ def werdykt(oceny: dict) -> list:
     linie = []
     if z.get("Reguła Sahm") == "CZERWONY":
         linie.append("Recesja potwierdzona danymi o zatrudnieniu.")
-    cykl = [k for k in GRUPY["Cykl i kredyt (wyprzedzające)"]
-            if z.get(k) == "CZERWONY"]
+    nazwy_cyklu = GRUPY["Cykl i kredyt (wyprzedzające)"]
+    cykl = [k for k in nazwy_cyklu if z.get(k) == "CZERWONY"]
+    brak_cyklu = [k for k in nazwy_cyklu if z.get(k) == "BRAK"]
     if cykl:
         linie.append(f"Zapalnik w cyklu/kredycie: {', '.join(cykl)}. "
                      "Podwyższona czujność - przypomnij sobie plan na bessę.")
+    elif brak_cyklu:
+        # Brak danych to NIE to samo co brak zagrożenia.
+        linie.append(f"Brak danych: {', '.join(brak_cyklu)} - "
+                     "cyklu i kredytu nie da się ocenić.")
     else:
         linie.append("Cykl i kredyt bez zapalnika recesyjnego.")
     if z.get("CAPE") == "CZERWONY":
@@ -248,14 +293,270 @@ def werdykt(oceny: dict) -> list:
                      "rebalancing i wpłaty, bez sprzedaży pod wpływem emocji.")
     cz = sum(v == "CZERWONY" for v in z.values())
     zo = sum(v == "ŻÓŁTY" for v in z.values())
-    linie.append(f"Czerwone: {cz}/{len(z)}, żółte: {zo}/{len(z)}. "
-                 "Barometr, nie zegarek - żadna strefa nie podaje daty.")
+    br = sum(v == "BRAK" for v in z.values())
+    linie.append(f"Czerwone: {cz}/{len(z)}, żółte: {zo}/{len(z)}"
+                 + (f", brak danych: {br}/{len(z)}" if br else "")
+                 + ". Barometr, nie zegarek - żadna strefa nie podaje daty.")
     return linie
 
 
 # =====================================================================
 # WYNIKI: tabela, wykres, historia
 # =====================================================================
+
+# =====================================================================
+# POLSKA - kontekst dla obligacji i portfela w PLN (bez stref)
+# =====================================================================
+
+EUROSTAT = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/"
+
+
+def pobierz_url(url: str, accept: str = None) -> str:
+    naglowki = {"User-Agent": "Mozilla/5.0 (kompas-rynku)"}
+    if accept:
+        naglowki["Accept"] = accept
+    with urllib.request.urlopen(urllib.request.Request(url, headers=naglowki), timeout=60) as odp:
+        return odp.read().decode("utf-8", errors="replace")
+
+
+def jsonstat_na_serie(obj: dict, wybor: list) -> pd.Series:
+    """Odczyt formatu JSON-stat (Eurostat).
+
+    Wszystkie liczby leżą w jednej płaskiej tablicy "value", a pozycję
+    liczy się jak w tablicy wielowymiarowej: wymiary w kolejności obj["id"],
+    ostatni zmienia się najszybciej. Dla każdego wymiaru poza czasem
+    wybieramy jedną kategorię: po kodzie, a gdy kodu nie ma - po
+    fragmencie etykiety (odporne na zmiany kodów, np. ECOICOP 2 w 2026).
+    """
+    ids, rozmiary = obj["id"], obj["size"]
+    pozycja = {}
+    for d in ids:
+        if d == "time":
+            continue
+        kat = obj["dimension"][d]["category"]
+        indeks, etykiety = kat["index"], kat.get("label", {})
+        if isinstance(indeks, list):  # JSON-stat dopuszcza też listę kodów
+            indeks = {k: i for i, k in enumerate(indeks)}
+        if len(indeks) == 1:
+            pozycja[d] = next(iter(indeks.values()))
+            continue
+        kod = None
+        for prefiks, kody, fragmenty in wybor:
+            if d.lower().startswith(prefiks):
+                kod = next((k for k in kody if k in indeks), None) or next(
+                    (k for k, l in etykiety.items() if any(f in l.lower() for f in fragmenty)), None)
+                break
+        if kod is None:
+            raise ValueError(f"nie umiem wybrać kategorii w wymiarze '{d}'")
+        pozycja[d] = indeks[kod]
+
+    mnozniki, m = [], 1
+    for r in reversed(rozmiary):
+        mnozniki.insert(0, m)
+        m *= r
+    wartosci = obj.get("value", {})
+    czas = obj["dimension"]["time"]["category"]["index"]
+    if isinstance(czas, list):
+        czas = {k: i for i, k in enumerate(czas)}
+    wynik = {}
+    for okres, poz in czas.items():
+        plaski = sum((poz if d == "time" else pozycja[d]) * mn for d, mn in zip(ids, mnozniki))
+        v = wartosci.get(str(plaski)) if isinstance(wartosci, dict) else (
+            wartosci[plaski] if plaski < len(wartosci) else None)
+        if v is not None:
+            wynik[pd.Period(okres.replace("M", "-"), "M").to_timestamp()] = float(v)
+    s = pd.Series(wynik, dtype=float).sort_index()
+    if s.empty:
+        raise ValueError("brak wartości dla wybranych kategorii")
+    return s
+
+
+def pobierz_eurostat(adresy: list, wybor: list):
+    """Próbuje kolejnych zapytań, aż któreś zadziała. Zwraca (seria, zbiór)."""
+    bledy = []
+    for zapytanie in adresy:
+        try:
+            obj = json.loads(pobierz_url(EUROSTAT + zapytanie))
+            return jsonstat_na_serie(obj, wybor), zapytanie.split("?")[0]
+        except Exception as e:
+            bledy.append(f"{zapytanie.split('?')[0]}: {e}")
+    raise ValueError("; ".join(bledy))
+
+
+def pobierz_inflacje_pl():
+    # Od 2026 Eurostat publikuje HICP w klasyfikacji ECOICOP 2 (zbiór
+    # prc_hicp_minr). Stary prc_hicp_manr jest zarchiwizowany - zostaje
+    # jako zapas, ale kończy się na grudniu 2025.
+    wybor = [("unit", ["RCH_A"], ["annual rate"]),
+             ("coicop", ["TOTAL", "CP00"], ["all-items", "all items"]),
+             ("geo", ["PL"], ["poland"])]
+    return pobierz_eurostat([
+        "prc_hicp_minr?format=JSON&geo=PL&unit=RCH_A&coicop18=TOTAL&sinceTimePeriod=2015-01",
+        "prc_hicp_minr?format=JSON&geo=PL&unit=RCH_A&sinceTimePeriod=2015-01",
+        "prc_hicp_manr?format=JSON&geo=PL&coicop=CP00&sinceTimePeriod=2015-01",
+    ], wybor)
+
+
+def pobierz_rentownosc_10l():
+    # Średnie miesięczne rentowności 10-letnich obligacji (kryterium z Maastricht).
+    wybor = [("int_rt", ["MCBY"], ["convergence"]), ("geo", ["PL"], ["poland"])]
+    return pobierz_eurostat(["irt_lt_mcby_m?format=JSON&geo=PL&sinceTimePeriod=2015-01"], wybor)
+
+
+def pobierz_kurs_nbp(waluta: str) -> pd.Series:
+    """Średnie kursy NBP (tabela A). API oddaje maks. 367 dni na zapytanie,
+    więc pobieramy w kawałkach po 360 dni."""
+    koniec = date.today()
+    a = koniec - timedelta(days=365 * LAT_NA_WYKRESIE + 31)
+    punkty = {}
+    while a <= koniec:
+        b = min(a + timedelta(days=360), koniec)
+        url = (f"https://api.nbp.pl/api/exchangerates/rates/a/{waluta}/"
+               f"{a:%Y-%m-%d}/{b:%Y-%m-%d}/?format=json")
+        try:
+            for r in json.loads(pobierz_url(url, "application/json"))["rates"]:
+                punkty[pd.Timestamp(r["effectiveDate"])] = float(r["mid"])
+        except urllib.error.HTTPError as e:
+            if e.code != 404:  # 404 = brak notowań w tym przedziale (np. weekend)
+                raise
+        a = b + timedelta(days=1)
+    if not punkty:
+        raise ValueError("NBP nie zwrócił kursów")
+    return pd.Series(punkty).sort_index()
+
+
+def stopa_referencyjna() -> tuple:
+    """Historia stopy referencyjnej z listy STOPA_REF_ZMIANY + próba
+    sprawdzenia aktualnej stopy w pliku XML NBP. Zwraca (seria, uwaga)."""
+    zmiany = dict(STOPA_REF_ZMIANY)
+    uwaga = "wg listy STOPA_REF_ZMIANY w skrypcie"
+    try:
+        xml = pobierz_url("https://static.nbp.pl/dane/stopy/stopy_procentowe.xml")
+        znacznik = re.search(r'<pozycja[^>]*id="ref"[^>]*>', xml)
+        stopa = re.search(r'oprocentowanie="([\d,\.]+)"', znacznik.group(0))
+        od = re.search(r'obowiazuje_od="(\d{4}-\d{2}-\d{2})"', znacznik.group(0)) or \
+            re.search(r'obowiazuje_od="(\d{4}-\d{2}-\d{2})"', xml)
+        nbp = (od.group(1), float(stopa.group(1).replace(",", ".")))
+        ostatnia = sorted(zmiany.items())[-1]
+        if nbp[1] != ostatnia[1] or nbp[0] > ostatnia[0]:
+            zmiany[nbp[0]] = nbp[1]
+            uwaga = (f"aktualna stopa pobrana z NBP ({nbp[1]:.2f}% od {nbp[0]}) - "
+                     "dopisz ją do STOPA_REF_ZMIANY")
+        else:
+            uwaga = "zgodna z NBP"
+    except Exception:
+        pass  # brak dostępu do NBP: zostaje lista z konfiguracji
+    s = pd.Series({pd.Timestamp(d): v for d, v in zmiany.items()}).sort_index()
+    return s, uwaga
+
+
+def zmiana_proc(s: pd.Series, miesiace: int) -> float:
+    przed = s[s.index <= s.index[-1] - pd.DateOffset(months=miesiace)]
+    return (s.iloc[-1] / przed.iloc[-1] - 1) * 100 if len(przed) else float("nan")
+
+
+def analiza_polska(pl: dict) -> list:
+    """Same fakty i proste różnice - bez stref i bez prognoz."""
+    linie = []
+    inf, ref, y10 = pl.get("inflacja"), pl.get("stopa"), pl.get("y10")
+    if inf is not None:
+        poza = "" if CEL_INFLACYJNY[0] <= inf.iloc[-1] <= CEL_INFLACYJNY[1] else ", poza pasmem celu"
+        linie.append(f"Inflacja HICP r/r: {inf.iloc[-1]:.1f}% (dane za {inf.index[-1]:%m.%Y})"
+                     f"; cel NBP 2,5% ± 1 pp{poza}.")
+    if ref is not None:
+        linie.append(f"Stopa referencyjna NBP: {ref.iloc[-1]:.2f}% "
+                     f"(od {ref.index[-1]:%d.%m.%Y}; {pl.get('stopa_uwaga', '')}).")
+    if inf is not None and ref is not None:
+        r = ref.iloc[-1] - inf.iloc[-1]
+        opis = "polityka pieniężna restrykcyjna" if r > 0 else "polityka pieniężna luźna"
+        linie.append(f"Realna stopa NBP (stopa ref. minus inflacja): {r:+.1f} pp, {opis}.")
+    if y10 is not None:
+        t = f"Rentowność 10-letnich obligacji skarbowych: {y10.iloc[-1]:.2f}% (średnia za {y10.index[-1]:%m.%Y})"
+        if inf is not None:
+            t += f", realnie {y10.iloc[-1] - inf.iloc[-1]:+.1f} pp ponad inflację"
+        linie.append(t + ".")
+    for w in ("EUR", "USD"):
+        s = pl.get(w)
+        if s is not None:
+            linie.append(f"{w}/PLN: {s.iloc[-1]:.4f} (zmiana 3 mies. {zmiana_proc(s, 3):+.1f}%, "
+                         f"12 mies. {zmiana_proc(s, 12):+.1f}%).")
+    if pl.get("EUR") is not None or pl.get("USD") is not None:
+        linie.append("Wyższy kurs, czyli słabszy złoty, podnosi wartość VWCE liczoną w PLN.")
+    for nazwa, blad in pl.get("bledy", {}).items():
+        linie.append(f"Brak danych: {nazwa} ({blad[:120]}).")
+    return linie
+
+
+def dane_polska_demo() -> dict:
+    rng = np.random.default_rng(7)
+    mies = pd.date_range("2015-01-01", date.today(), freq="MS")
+    rok = mies.year + mies.month / 12
+    inf = 1.5 + 16 * np.exp(-((rok - 2023.1) / 0.6) ** 2) + 0.8 * (rok > 2026.4) + rng.normal(0, 0.2, len(mies))
+    y10 = 3 + 3.5 * np.exp(-((rok - 2022.9) / 1.0) ** 2) + 2 * (rok > 2022) + rng.normal(0, 0.1, len(mies))
+    dni = pd.bdate_range(date.today() - timedelta(days=365 * LAT_NA_WYKRESIE + 31), date.today())
+    eur = 4.4 + np.cumsum(rng.normal(0, 0.006, len(dni)))
+    usd = 4.0 + np.cumsum(rng.normal(0, 0.008, len(dni)))
+    s = pd.Series({pd.Timestamp(d): v for d, v in STOPA_REF_ZMIANY}).sort_index()
+    return {"inflacja": pd.Series(inf, index=mies), "y10": pd.Series(y10, index=mies),
+            "EUR": pd.Series(eur, index=dni), "USD": pd.Series(usd, index=dni),
+            "stopa": s, "stopa_uwaga": "wg listy STOPA_REF_ZMIANY w skrypcie", "bledy": {}}
+
+
+def pobierz_polska() -> dict:
+    pl, bledy = {}, {}
+    for nazwa, klucz, funkcja in [
+        ("inflacja HICP (Eurostat)", "inflacja", lambda: pobierz_inflacje_pl()[0]),
+        ("rentowność 10-latek (Eurostat)", "y10", lambda: pobierz_rentownosc_10l()[0]),
+        ("kurs EUR/PLN (NBP)", "EUR", lambda: pobierz_kurs_nbp("eur")),
+        ("kurs USD/PLN (NBP)", "USD", lambda: pobierz_kurs_nbp("usd")),
+    ]:
+        try:
+            pl[klucz] = funkcja()
+            print(f"  pobrano {nazwa}: ostatni odczyt {pl[klucz].index[-1]:%Y-%m-%d}")
+        except Exception as e:  # polskie dane są kontekstem - ich brak nie blokuje raportu
+            bledy[nazwa] = str(e)
+            print(f"  BŁĄD pobierania {nazwa}: {e}")
+    pl["stopa"], pl["stopa_uwaga"] = stopa_referencyjna()
+    pl["bledy"] = bledy
+    return pl
+
+
+def przygotuj_polska(pl: dict) -> dict:
+    """Punkty do dwóch wykresów: stopy i inflacja oraz kursy walut."""
+    od = pd.Timestamp(date.today()) - pd.DateOffset(years=LAT_NA_WYKRESIE)
+
+    def pkt(s):
+        s = s[s.index >= od].dropna()
+        return [[int(t.timestamp() * 1000), round(float(v), 4)] for t, v in s.items()]
+
+    stopy = []
+    if pl.get("inflacja") is not None:
+        stopy.append({"nazwa": "inflacja HICP r/r", "pkt": pkt(pl["inflacja"]), "kolor": "--tusz"})
+    if pl.get("stopa") is not None:
+        s = pl["stopa"]
+        # punkt startowy wykresu i "dziś", żeby schodki sięgały krawędzi
+        przed = s[s.index <= od]
+        s = pd.concat([pd.Series({od: przed.iloc[-1]}) if len(przed) else pd.Series(dtype=float),
+                       s[s.index > od], pd.Series({pd.Timestamp(date.today()): s.iloc[-1]})])
+        stopy.append({"nazwa": "stopa referencyjna NBP", "pkt": pkt(s), "kolor": "--seria2", "schodki": True})
+    if pl.get("y10") is not None:
+        stopy.append({"nazwa": "rentowność 10-latek", "pkt": pkt(pl["y10"]), "kolor": "--tusz3", "kreski": True})
+    kursy = []
+    for w, kolor in (("EUR", "--tusz"), ("USD", "--seria2")):
+        if pl.get(w) is not None:
+            kursy.append({"nazwa": f"{w}/PLN", "pkt": pkt(pl[w].resample("W").last()), "kolor": kolor})
+    return {"linie": analiza_polska(pl), "stopy": stopy, "kursy": kursy,
+            "pasmo": list(CEL_INFLACYJNY)}
+
+
+def historia_polska(pl: dict) -> dict:
+    w = {}
+    for klucz, kolumna in (("inflacja", "PL inflacja HICP [%]"), ("stopa", "PL stopa ref. [%]"),
+                           ("y10", "PL rentowność 10L [%]"), ("EUR", "EUR/PLN"), ("USD", "USD/PLN")):
+        s = pl.get(klucz)
+        w[kolumna] = round(float(s.iloc[-1]), 4) if s is not None else None
+    return w
+
 
 def formatuj(nazwa: str, wart: float) -> str:
     if pd.isna(wart):
@@ -299,7 +600,7 @@ def przygotuj_serie(dane: dict) -> dict:
     return serie
 
 
-def zapisz_html(dane: dict, oceny: dict, linie: list, demo: bool) -> Path:
+def zapisz_html(dane: dict, oceny: dict, linie: list, demo: bool, pl: dict) -> Path:
     """Wkłada dane jako JSON do szablonu HTML. Cały wygląd i wykresy
     robi przeglądarka (Chart.js), Python tylko liczy i dostarcza liczby."""
     dane_raportu = {
@@ -310,6 +611,7 @@ def zapisz_html(dane: dict, oceny: dict, linie: list, demo: bool) -> Path:
                   for k, (z, w, kom) in oceny.items()},
         "werdykt": linie,
         "serie": przygotuj_serie(dane),
+        "polska": przygotuj_polska(pl),
         "cape": {"wartosc": CAPE_RECZNIE, "progi": list(PROGI["CAPE"]),
                  "data": CAPE_DATA},
     }
@@ -375,6 +677,7 @@ footer{margin-top:34px;color:var(--tusz3);font-size:13px;max-width:80ch}
 <section class="panel" id="panel" aria-label="Stan wskaźników"></section>
 <ul class="werdykt" id="werdykt"></ul>
 <div id="grupy"></div>
+<div id="polska"></div>
 <footer>Kompas pokazuje stan rynku według reguł ustalonych z góry. Nie podaje daty spadków ani wzrostów.
 Progi stref zmieniasz w słowniku PROGI w skrypcie. Każde uruchomienie dopisuje odczyt do pliku kompas_historia.csv.</footer>
 </main>
@@ -421,6 +724,19 @@ D.grupy.forEach(([grupa, nazwy]) => {
 });
 document.getElementById("grupy").innerHTML = h;
 
+// Polska: fakty bez stref + dwa wykresy
+const P = D.polska;
+let hp = '<h2>Polska: stopy, inflacja, złoty</h2><div class="karta"><ul class="werdykt" style="margin:0">' +
+  P.linie.map(l => "<li>" + l + "</li>").join("") + "</ul>" +
+  '<p class="kom" style="margin:10px 0 0;min-height:0">Obligacje detaliczne: ROR i DOR idą za stopą referencyjną NBP; ' +
+  "OTS i TOS mają stałe oprocentowanie ustalone przy zakupie; COI, EDO i ROD zarabiają inflację CPI z GUS (z opóźnieniem) plus marżę. " +
+  "Inflacja na wykresie to HICP z Eurostatu, zwykle bliska CPI z GUS.</p></div>" + '<div class="siatka" style="margin-top:14px">';
+[["stopy", "Stopy i inflacja [%], zielone pole: cel NBP", "pl0"], ["kursy", "Kursy średnie NBP [zł]", "pl1"]].forEach(([k, tytul, id]) => {
+  if (P[k].length) hp += '<div class="karta"><div class="glowa"><span class="nazwa">' + tytul + '</span></div>' +
+    '<div class="wykres" style="height:230px"><canvas id="' + id + '" role="img" aria-label="Wykres: ' + tytul + '"></canvas></div></div>';
+});
+document.getElementById("polska").innerHTML = hp + "</div>";
+
 if (!window.Chart) {
   document.querySelectorAll(".wykres").forEach(el => el.outerHTML = '<div class="brakjs">Wykresy wymagają internetu (biblioteka Chart.js).</div>');
 } else {
@@ -432,6 +748,10 @@ if (!window.Chart) {
           const g = y.getPixelForValue(Math.min(hi, y.max)), d = y.getPixelForValue(Math.max(lo, y.min));
           if (d > g) { ctx.fillStyle = kol; ctx.fillRect(ca.left, g, ca.right - ca.left, d - g); }
         });
+    }
+    if (o.pasmo) {
+      const g = y.getPixelForValue(Math.min(o.pasmo[1], y.max)), d = y.getPixelForValue(Math.max(o.pasmo[0], y.min));
+      if (d > g) { ctx.fillStyle = "rgba(47,138,74,0.12)"; ctx.fillRect(ca.left, g, ca.right - ca.left, d - g); }
     }
     if (o.zero) {
       const p = y.getPixelForValue(0);
@@ -455,6 +775,23 @@ if (!window.Chart) {
                     ticks: {color: css("--tusz3"), callback: v => new Date(v).getFullYear()}, grid: {display: false}},
                  y: {min: mn, max: mx, ticks: {color: css("--tusz3"), maxTicksLimit: 5}, grid: {color: css("--linia")}}}}});
   });
+  const latka = ax => { ax.ticks = []; for (let r = new Date(ax.min).getFullYear() + 1; r <= new Date(ax.max).getFullYear(); r++) ax.ticks.push({value: Date.UTC(r, 0, 1)}); };
+  [["stopy", "pl0"], ["kursy", "pl1"]].forEach(([k, id]) => {
+    if (!P[k].length) return;
+    const ds = P[k].map(s => ({label: s.nazwa, data: s.pkt.map(p => ({x: p[0], y: p[1]})), borderColor: css(s.kolor),
+      backgroundColor: css(s.kolor), borderWidth: 2, pointRadius: 0, stepped: !!s.schodki,
+      borderDash: s.kreski ? [5, 4] : [], tension: s.schodki ? 0 : 0.2}));
+    const xs = ds.flatMap(d => d.data.map(p => p.x));
+    new Chart(document.getElementById(id), {type: "line", data: {datasets: ds}, plugins: [pasy],
+      options: {responsive: true, maintainAspectRatio: false, animation: false,
+        interaction: {mode: "nearest", axis: "x", intersect: false},
+        plugins: {legend: {position: "bottom", labels: {color: css("--tusz2"), boxWidth: 16, boxHeight: 2, font: {size: 12}}},
+          pasy: k === "stopy" ? {pasmo: P.pasmo} : {},
+          tooltip: {callbacks: {title: it => dzien(it[0].parsed.x), label: c => c.dataset.label + ": " + c.parsed.y.toFixed(k === "kursy" ? 4 : 2)}}},
+        scales: {x: {type: "linear", min: Math.min(...xs), max: Math.max(...xs), afterBuildTicks: latka,
+                     ticks: {color: css("--tusz3"), callback: v => new Date(v).getFullYear()}, grid: {display: false}},
+                 y: {ticks: {color: css("--tusz3"), maxTicksLimit: 6}, grid: {color: css("--linia")}}}}});
+  });
 }
 </script>
 </body>
@@ -462,15 +799,21 @@ if (!window.Chart) {
 """
 
 
-def dopisz_historie(oceny: dict, linie: list, demo: bool):
+def dopisz_historie(oceny: dict, linie: list, demo: bool, pl: dict):
     wiersz = {"data": f"{date.today():%Y-%m-%d}", "demo": demo}
     for k, (zs, wart, _) in oceny.items():
         wiersz[f"{k} [wartość]"] = round(float(wart), 3) if zs != "BRAK" else None
         wiersz[f"{k} [strefa]"] = zs
+    wiersz.update(historia_polska(pl))
     wiersz["werdykt"] = " | ".join(linie)
     plik = FOLDER / "kompas_historia.csv"
-    pd.DataFrame([wiersz]).to_csv(plik, mode="a", index=False,
-                                  header=not plik.exists(), encoding="utf-8-sig")
+    nowy = pd.DataFrame([wiersz])
+    # Wczytujemy i zapisujemy całość zamiast dopisywać: gdy dojdą nowe
+    # kolumny (jak teraz polskie dane), stare wiersze dostaną puste pola,
+    # a kolumny się nie rozjadą.
+    if plik.exists():
+        nowy = pd.concat([pd.read_csv(plik, encoding="utf-8-sig"), nowy], ignore_index=True)
+    nowy.to_csv(plik, index=False, encoding="utf-8-sig")
     return plik
 
 
@@ -487,6 +830,7 @@ def main():
 
     if demo:
         dane = dane_demo()
+        pl = dane_polska_demo()
     else:
         dane = {}
         for seria in ["T10Y3M", "BAMLH0A0HYM2", "SAHMREALTIME", "VIXCLS", "SP500"]:
@@ -495,6 +839,12 @@ def main():
                 print(f"  pobrano {seria}: ostatni odczyt {dane[seria].index[-1]:%Y-%m-%d}")
             except Exception as e:  # jedna niedostępna seria nie zatrzymuje reszty
                 print(f"  BŁĄD pobierania {seria}: {e}")
+        if not dane:
+            # Nic się nie pobrało: kończymy z błędem, żeby nie nadpisać
+            # dobrego raportu pustym. GitHub oznaczy przebieg na czerwono.
+            print("\nNie udało się pobrać żadnej serii z FRED - raport nie został zapisany.")
+            sys.exit(1)
+        pl = pobierz_polska()
 
     funkcje = {
         "CAPE": (None, lambda _: ocena_cape()),
@@ -523,8 +873,12 @@ def main():
     for l in linie:
         print(f"  - {l}")
 
-    raport = zapisz_html(dane, oceny, linie, demo)
-    csv = dopisz_historie(oceny, linie, demo)
+    print("\nPOLSKA (kontekst, bez stref)")
+    for l in analiza_polska(pl):
+        print(f"  - {l}")
+
+    raport = zapisz_html(dane, oceny, linie, demo, pl)
+    csv = dopisz_historie(oceny, linie, demo, pl)
     print(f"\nRaport:   {raport}\n          (ostatni zawsze też jako kompas_najnowszy.html)"
           f"\nHistoria: {csv}")
 
